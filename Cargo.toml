@@ -12,6 +12,11 @@ readme = "README.md"
 members = ["."]
 resolver = "3"
 
+[features]
+default = ["engine", "boot"]
+engine = []
+boot = []
+
 [dependencies]
 sha2 = { version = "0.10", default-features = false }
 
