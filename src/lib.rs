@@ -39,19 +39,31 @@
 //! the multi-artifact and rollback paths are built out on top of it.
 #![no_std]
 
+#[cfg(feature = "engine")]
 extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+#[cfg(feature = "engine")]
 pub mod artifact;
+#[cfg(feature = "boot")]
 pub mod boot;
+#[cfg(feature = "engine")]
 pub mod error;
+#[cfg(feature = "engine")]
 pub mod state;
+#[cfg(feature = "engine")]
 pub mod storage;
+#[cfg(feature = "engine")]
 pub mod transaction;
 
+#[cfg(feature = "engine")]
 pub use artifact::{Committed, Digest, ResumePlan, WriteSession, is_complete, resume_plan};
+#[cfg(feature = "engine")]
 pub use error::Error;
+#[cfg(feature = "engine")]
 pub use state::{Action, BackendOutcome, TransactionState};
+#[cfg(feature = "engine")]
 pub use storage::{ArtifactStorage, TransactionMetadata};
+#[cfg(feature = "engine")]
 pub use transaction::{ArtifactRecord, TransactionRecord, activate, clear_stale, finish, reconcile};
