@@ -15,6 +15,7 @@ jobs:
           toolchain: "1.88.0"
           components: clippy
       - run: cargo test -p fibewi --all-targets
+      - run: cargo check -p fibewi --no-default-features --features boot
       - run: cargo clippy -p fibewi --lib -- -D warnings -A clippy::result-unit-err -A clippy::needless-range-loop
 
   exhaustive:
