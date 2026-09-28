@@ -203,7 +203,6 @@ pub fn staged_from_transaction(record: Option<&Transaction>) -> Result<Staged, M
     let stage = match record.state {
         TransactionState::Staged => Stage::Written,
         TransactionState::Activating => Stage::Activating,
-        _ => return Err(MetadataError::Corrupt),
     };
     let [artifact] = record.artifacts.as_slice() else {
         return Err(MetadataError::Corrupt);
