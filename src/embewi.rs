@@ -4,8 +4,9 @@
 //! Targets are opaque names; the platform adapter translates them to slots.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 use core::fmt::Write as _;
-use crate::{Action, ArtifactRecord, BackendOutcome, Digest, TransactionRecord, TransactionState, reconcile};
+use crate::{Action, ArtifactRecord, BackendOutcome, Digest, TransactionMetadata, TransactionRecord, TransactionState, reconcile};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataError { Persistence, Corrupt, TooLarge }
@@ -63,6 +64,50 @@ pub struct Metadata {
     pub staged: Staged,
     pub active_digest: String,
     pub active_deployment_id: String,
+}
+
+/// Abstract access to the OTA component's atomically published byte space.
+/// ConfigSpace, file backed storage and other platforms can provide it.
+#[allow(async_fn_in_trait)]
+pub trait MetadataStore {
+    type Error;
+    async fn load_raw(&self) -> Result<Option<Vec<u8>>, Self::Error>;
+    async fn commit_raw(&self, bytes: &[u8]) -> Result<(), Self::Error>;
+}
+
+pub async fn load_metadata<S: MetadataStore>(store: &S) -> Result<Metadata, MetadataError> {
+    match store.load_raw().await.map_err(|_| MetadataError::Persistence)? {
+        Some(raw) => Metadata::decode(&raw),
+        None => Ok(Metadata::default()),
+    }
+}
+
+pub async fn save_metadata<S: MetadataStore>(store: &S, metadata: &Metadata) -> Result<(), MetadataError> {
+    let bytes = metadata.encode()?;
+    store.commit_raw(&bytes).await.map_err(|_| MetadataError::Persistence)
+}
+
+pub async fn clear_staged<S: MetadataStore>(store: &S) -> Result<(), MetadataError> {
+    let mut metadata = load_metadata(store).await?;
+    metadata.set_staged(Staged::default());
+    save_metadata(store, &metadata).await
+}
+
+pub async fn load_transaction<S: MetadataStore>(store: &S) -> Result<Option<Transaction>, MetadataError> {
+    let metadata = load_metadata(store).await?;
+    Ok(transaction_from_staged(&metadata.staged))
+}
+
+pub async fn commit_transaction<S: MetadataStore>(store: &S, record: Option<&Transaction>) -> Result<(), MetadataError> {
+    let mut metadata = load_metadata(store).await?;
+    metadata.set_staged(staged_from_transaction(record)?);
+    save_metadata(store, &metadata).await
+}
+
+pub async fn promote_staged<S: MetadataStore>(store: &S, staged: &Staged) -> Result<(), MetadataError> {
+    let mut metadata = load_metadata(store).await?;
+    metadata.promote_staged(staged);
+    save_metadata(store, &metadata).await
 }
 
 impl Metadata {
@@ -165,6 +210,26 @@ impl Metadata {
 }
 
 pub type Transaction = TransactionRecord<String, String, String>;
+
+/// In-memory staging for FiBeWI's synchronous transition API. Its result
+/// must be persisted by the caller before switching the physical boot slot.
+pub struct MemoryTransactionMetadata {
+    pub record: Option<Transaction>,
+}
+
+impl TransactionMetadata for MemoryTransactionMetadata {
+    type Error = ();
+    type Record = Transaction;
+
+    fn load(&mut self) -> Result<Option<Self::Record>, Self::Error> {
+        Ok(self.record.clone())
+    }
+
+    fn commit(&mut self, record: Option<&Self::Record>) -> Result<(), Self::Error> {
+        self.record = record.cloned();
+        Ok(())
+    }
+}
 
 /// Publish one verified firmware artifact as an Embewi transaction. The
 /// platform provides only the target name; FiBeWI owns the record shape.
