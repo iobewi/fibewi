@@ -110,6 +110,43 @@ pub async fn promote_staged<S: MetadataStore>(store: &S, staged: &Staged) -> Res
     save_metadata(store, &metadata).await
 }
 
+/// Complete bookkeeping after the platform confirms the running image.
+/// The activating record survives a failed commit, allowing the next boot
+/// to repeat either step without losing the validated image's identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishValidationError {
+    Promote(MetadataError),
+    Clear(MetadataError),
+}
+
+pub async fn finish_validation<S: MetadataStore>(
+    store: &S,
+    staged: &Staged,
+) -> Result<(), FinishValidationError> {
+    promote_staged(store, staged).await.map_err(FinishValidationError::Promote)?;
+    clear_staged(store).await.map_err(FinishValidationError::Clear)
+}
+
+/// The pending image has this long to pass the application self-check.
+pub const PENDING_VERIFY_TIMEOUT_MS: u64 = 15_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingCheckAction {
+    Confirm,
+    Reject,
+    Reset,
+}
+
+/// `None` means the self-check timed out; leave the boot record pending so
+/// the bootloader can roll it back after the reset.
+pub const fn pending_check_action(check: Option<bool>) -> PendingCheckAction {
+    match check {
+        Some(true) => PendingCheckAction::Confirm,
+        Some(false) => PendingCheckAction::Reject,
+        None => PendingCheckAction::Reset,
+    }
+}
+
 impl Metadata {
     /// Matches the existing ConfigSpace allocation for OTA metadata.
     pub const MAX_BYTES: usize = 512;
@@ -506,5 +543,62 @@ mod tests {
         assert_eq!(reloaded.staged.stage.as_str(), "none");
         assert_eq!(reloaded.active_digest, "sha256:active");
         assert_eq!(reloaded.active_deployment_id, "running");
+    }
+
+    #[test]
+    fn validation_retries_after_the_clear_commit_fails() {
+        struct FailSecondCommit {
+            raw: RefCell<Option<Vec<u8>>>,
+            commits: RefCell<usize>,
+        }
+        impl MetadataStore for FailSecondCommit {
+            type Error = ();
+            async fn load_raw(&self) -> Result<Option<Vec<u8>>, ()> {
+                Ok(self.raw.borrow().clone())
+            }
+            async fn commit_raw(&self, bytes: &[u8]) -> Result<(), ()> {
+                let mut commits = self.commits.borrow_mut();
+                *commits += 1;
+                if *commits == 2 {
+                    return Err(());
+                }
+                *self.raw.borrow_mut() = Some(bytes.to_vec());
+                Ok(())
+            }
+        }
+
+        let staged = Staged {
+            stage: Stage::Activating,
+            slot: String::from("bank-b"),
+            digest: String::from("sha256:new"),
+            deployment_id: String::from("new"),
+            size: 100,
+        };
+        let initial = Metadata {
+            staged: staged.clone(),
+            active_digest: String::from("sha256:old"),
+            active_deployment_id: String::from("old"),
+        };
+        let store = FailSecondCommit {
+            raw: RefCell::new(Some(initial.encode().unwrap())),
+            commits: RefCell::new(0),
+        };
+        assert_eq!(ready(finish_validation(&store, &staged)), Err(FinishValidationError::Clear(MetadataError::Persistence)));
+        let interrupted = ready(load_metadata(&store)).unwrap();
+        assert!(interrupted.staged.stage == Stage::Activating);
+        assert_eq!(interrupted.active_deployment_id, "new");
+
+        ready(finish_validation(&store, &staged)).unwrap();
+        let completed = ready(load_metadata(&store)).unwrap();
+        assert!(completed.staged.stage == Stage::None);
+        assert_eq!(completed.active_digest, "sha256:new");
+        assert_eq!(completed.active_deployment_id, "new");
+    }
+
+    #[test]
+    fn pending_check_only_confirms_after_success() {
+        assert_eq!(pending_check_action(Some(true)), PendingCheckAction::Confirm);
+        assert_eq!(pending_check_action(Some(false)), PendingCheckAction::Reject);
+        assert_eq!(pending_check_action(None), PendingCheckAction::Reset);
     }
 }
