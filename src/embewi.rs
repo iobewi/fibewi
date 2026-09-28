@@ -380,6 +380,34 @@ pub fn boot_action(staged: &Staged, image: BackendOutcome, booted_slot: Option<&
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    struct MemoryStore(RefCell<Option<Vec<u8>>>);
+
+    impl MetadataStore for MemoryStore {
+        type Error = ();
+        async fn load_raw(&self) -> Result<Option<Vec<u8>>, Self::Error> {
+            Ok(self.0.borrow().clone())
+        }
+        async fn commit_raw(&self, bytes: &[u8]) -> Result<(), Self::Error> {
+            *self.0.borrow_mut() = Some(bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    fn ready<F: Future>(future: F) -> F::Output {
+        struct Noop;
+        impl Wake for Noop { fn wake(self: Arc<Self>) {} }
+        let waker = Waker::from(Arc::new(Noop));
+        let mut future = std::pin::pin!(future);
+        match future.as_mut().poll(&mut Context::from_waker(&waker)) {
+            Poll::Ready(value) => value,
+            Poll::Pending => panic!("in-memory store must be immediately ready"),
+        }
+    }
 
     #[test]
     fn reads_existing_otm1_record_and_keeps_its_layout() {
@@ -454,5 +482,29 @@ mod tests {
         };
         assert_eq!(boot_action(&staged, BackendOutcome::PendingConfirmation, None), Action::AwaitConfirmation);
         assert_eq!(boot_action(&staged, BackendOutcome::PendingConfirmation, Some("bank-a")), Action::RollbackUnaccounted);
+    }
+
+    #[test]
+    fn clearing_staged_transaction_preserves_active_identity() {
+        let store = MemoryStore(RefCell::new(None));
+        let mut metadata = Metadata {
+            active_digest: String::from("sha256:active"),
+            active_deployment_id: String::from("running"),
+            ..Metadata::default()
+        };
+        metadata.staged = Staged {
+            stage: Stage::Written,
+            slot: String::from("bank-b"),
+            digest: format_digest(&Digest([0x13; 32])),
+            deployment_id: String::from("candidate"),
+            size: 10,
+        };
+        ready(save_metadata(&store, &metadata)).unwrap();
+        assert!(ready(load_transaction(&store)).unwrap().is_some());
+        ready(clear_staged(&store)).unwrap();
+        let reloaded = ready(load_metadata(&store)).unwrap();
+        assert_eq!(reloaded.staged.stage.as_str(), "none");
+        assert_eq!(reloaded.active_digest, "sha256:active");
+        assert_eq!(reloaded.active_deployment_id, "running");
     }
 }
