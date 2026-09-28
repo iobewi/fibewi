@@ -5,7 +5,7 @@
 
 use alloc::string::String;
 use core::fmt::Write as _;
-use crate::{ArtifactRecord, Digest, TransactionRecord, TransactionState};
+use crate::{Action, ArtifactRecord, BackendOutcome, Digest, TransactionRecord, TransactionState, reconcile};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataError { Persistence, Corrupt, TooLarge }
@@ -29,6 +29,14 @@ impl Stage {
             Stage::None => "none",
             Stage::Written => "written",
             Stage::Activating => "activating",
+        }
+    }
+
+    pub const fn transaction_state(self) -> Option<TransactionState> {
+        match self {
+            Self::None => None,
+            Self::Written => Some(TransactionState::Staged),
+            Self::Activating => Some(TransactionState::Activating),
         }
     }
 }
@@ -158,6 +166,15 @@ impl Metadata {
 
 pub type Transaction = TransactionRecord<String, String, String>;
 
+/// Publish one verified firmware artifact as an Embewi transaction. The
+/// platform provides only the target name; FiBeWI owns the record shape.
+pub fn firmware_record(deployment_id: String, size: u64, digest: Digest, target: String) -> Transaction {
+    Transaction::staged(
+        deployment_id,
+        ArtifactRecord { id: String::from("firmware"), size, digest, target },
+    )
+}
+
 pub fn parse_digest(value: &str) -> Option<Digest> {
     let hex = value.strip_prefix("sha256:")?;
     if hex.len() != 64 {
@@ -225,6 +242,76 @@ pub fn can_supersede(record: Option<&Transaction>) -> bool {
     record.is_none_or(|record| record.state == TransactionState::Staged)
 }
 
+/// Identity fixed by the first upload request. Later chunks must repeat it.
+#[derive(Clone, Debug)]
+pub struct SessionParams {
+    pub deployment_id: String,
+    pub digest: String,
+    pub total: u32,
+}
+
+impl SessionParams {
+    pub fn matches(&self, other: &Self) -> bool {
+        self.deployment_id == other.deployment_id
+            && self.digest.eq_ignore_ascii_case(&other.digest)
+            && self.total == other.total
+    }
+}
+
+/// Business outcomes for Embewi's prepare request. HTTP rendering belongs
+/// to the agent's transport layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareRefusal {
+    ChipMismatch,
+    LayoutMismatch,
+    Busy,
+    SizeTooLarge,
+}
+
+impl PrepareRefusal {
+    pub const fn reason(self) -> &'static str {
+        match self {
+            Self::ChipMismatch => "chip_mismatch",
+            Self::LayoutMismatch => "layout_mismatch",
+            Self::Busy => "busy",
+            Self::SizeTooLarge => "size_too_large",
+        }
+    }
+}
+
+/// Check compatibility before examining any flash or metadata.
+pub fn check_compatibility(chip: &str, layout: &str, platform_chip: &str, platform_layout: &str) -> Result<(), PrepareRefusal> {
+    if chip != platform_chip {
+        return Err(PrepareRefusal::ChipMismatch);
+    }
+    if layout != platform_layout {
+        return Err(PrepareRefusal::LayoutMismatch);
+    }
+    Ok(())
+}
+
+/// Check size before consulting staged transactions. The platform chooses
+/// the target and reports its capacity; FiBeWI decides if a write is safe.
+pub fn check_target(size: u64, capacity: Option<u64>) -> Result<(), PrepareRefusal> {
+    let capacity = capacity.ok_or(PrepareRefusal::Busy)?;
+    if size > capacity {
+        return Err(PrepareRefusal::SizeTooLarge);
+    }
+    Ok(())
+}
+
+pub fn check_staged(record: Option<&Transaction>) -> Result<(), PrepareRefusal> {
+    if can_supersede(record) { Ok(()) } else { Err(PrepareRefusal::Busy) }
+}
+
+/// Reconcile the persisted Embewi record against the platform's boot report.
+/// An unknown booted slot stays unknown so no destructive recovery follows
+/// from a failed hardware read.
+pub fn boot_action(staged: &Staged, image: BackendOutcome, booted_slot: Option<&str>) -> Action {
+    let matches_staged = booted_slot.map(|slot| slot == staged.slot);
+    reconcile(staged.stage.transaction_state(), image, matches_staged)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +358,36 @@ mod tests {
         assert_eq!(transaction_from_staged(&staged).unwrap().artifacts[0].target, "bank-b");
         assert!(can_supersede(Some(&record)));
         assert!(!can_supersede(Some(&record.with_state(TransactionState::Activating))));
+    }
+
+    #[test]
+    fn prepare_refuses_an_activating_transaction_without_erasing_it() {
+        let record = Transaction::staged(
+            String::from("deploy"),
+            ArtifactRecord { id: String::from("firmware"), size: 10, digest: Digest([0x13; 32]), target: String::from("bank-b") },
+        ).with_state(TransactionState::Activating);
+        assert_eq!(check_staged(Some(&record)), Err(PrepareRefusal::Busy));
+        assert_eq!(check_target(11, Some(10)), Err(PrepareRefusal::SizeTooLarge));
+        assert_eq!(check_compatibility("RP2350", "v1", "ESP32-S3", "v1"), Err(PrepareRefusal::ChipMismatch));
+        assert_eq!(record.state, TransactionState::Activating);
+    }
+
+    #[test]
+    fn continuing_upload_keeps_identity_and_accepts_uppercase_digest() {
+        let session = SessionParams { deployment_id: String::from("deploy"), digest: String::from("sha256:abc"), total: 10 };
+        let next = SessionParams { deployment_id: String::from("deploy"), digest: String::from("sha256:ABC"), total: 10 };
+        assert!(session.matches(&next));
+        assert!(!session.matches(&SessionParams { total: 11, ..next }));
+    }
+
+    #[test]
+    fn unknown_boot_slot_does_not_trigger_rollback() {
+        let staged = Staged {
+            stage: Stage::Activating,
+            slot: String::from("bank-b"),
+            ..Staged::default()
+        };
+        assert_eq!(boot_action(&staged, BackendOutcome::PendingConfirmation, None), Action::AwaitConfirmation);
+        assert_eq!(boot_action(&staged, BackendOutcome::PendingConfirmation, Some("bank-a")), Action::RollbackUnaccounted);
     }
 }
