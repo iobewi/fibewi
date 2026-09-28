@@ -1,5 +1,11 @@
 # FiBeWI
 
+> **Migration :** le développement du moteur OTA se poursuit dans
+> [`iobewi/services/ota`](https://github.com/iobewi/iobewi/tree/refactor/iobewi-ota/services/ota)
+> (`iobewi-ota`). Les règles EWBT et le validateur d'image ESP sont dans
+> [`iobewi-esp/hardware/ota-boot`](https://github.com/iobewi/iobewi-esp/tree/refactor/iobewi-ota/hardware/ota-boot).
+> Ce dépôt reste disponible pour l'historique et les versions déjà épinglées.
+
 FiBeWI is a `no_std` firmware lifecycle engine focused on transactional,
 resumable updates and restart-safe A/B activation.
 
