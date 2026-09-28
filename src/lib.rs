@@ -51,6 +51,8 @@ pub mod boot;
 #[cfg(feature = "engine")]
 pub mod error;
 #[cfg(feature = "engine")]
+pub mod embewi;
+#[cfg(feature = "engine")]
 pub mod state;
 #[cfg(feature = "engine")]
 pub mod storage;

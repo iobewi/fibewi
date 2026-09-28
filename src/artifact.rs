@@ -153,6 +153,15 @@ impl WriteSession {
         self.received
     }
 
+    /// Whether another chunk fits the declared image length. Backends can
+    /// check this before erasing a block for a chunk that would be refused.
+    pub fn can_append(&self, len: usize) -> bool {
+        u64::try_from(len)
+            .ok()
+            .and_then(|len| self.received.checked_add(len))
+            .is_some_and(|end| end <= self.total)
+    }
+
     /// Bytes the backend has confirmed durable. The point it's safe to
     /// resume from after an interruption.
     pub fn durable(&self) -> u64 {
@@ -175,10 +184,10 @@ impl WriteSession {
     /// practice) -- seeing `write` called at all is not a promise of
     /// progress on its own.
     pub fn append<S: ArtifactStorage>(&mut self, storage: &mut S, data: &[u8]) -> Result<(), Error<S::Error>> {
-        let end = self.received.checked_add(data.len() as u64).ok_or(Error::TooLarge)?;
-        if end > self.total {
+        if !self.can_append(data.len()) {
             return Err(Error::TooLarge);
         }
+        let end = self.received + data.len() as u64;
         self.pending.extend_from_slice(data);
         self.received = end;
 
